@@ -49,6 +49,7 @@ Call it **exactly once**. The output is a JSON object with these fields:
 - `failing_check_contexts` — for each failing check: `check_name`, `conclusion`, `summary`, `failure_excerpt`, `annotations`, `html_url`, `other_prs` (same check's status on each sampled PR)
 - `greptile_score` — int 1–5 or `null`
 - `has_circleci_checks` — bool
+- `veria` — `{ran: bool, high_count: int, all_findings: [{severity, html_url}]}` or `null` on fetch error. `ran=false` means Veria has not commented on this PR yet. `high_count` counts inline review comments tagged `High` or `Critical`.
 
 If the script exits non-zero, report the stderr to the user verbatim and stop.
 
@@ -83,20 +84,22 @@ Exactly one of:
 - `in_progress_checks` is empty
 - `greptile_score` is `null` OR `>= 4`
 - `has_circleci_checks` is `true`
+- `veria` is `null` OR `veria.ran is false` OR `veria.high_count == 0`
 
 Otherwise `ready` is `false`.
 
-## Step 5: emit the 5-item checklist
+## Step 5: emit the 6-item checklist
 
-Exactly these 5 items in this order:
+Exactly these 6 items in this order:
 
 1. `All checks completed` — passed iff `in_progress_checks` is empty. Note when not passed: `<N> still running: <comma-joined names, max 3>`.
 2. `No failing checks` — passed iff `failing_check_contexts` is empty. Note when not passed: `<N> failing: <comma-joined check_names, max 3>`.
 3. `No PR-related failures` — passed iff no failure has `related_to_pr_diff == true`. Note when not passed: `<N> PR-related: <comma-joined check_names, max 3>`.
 4. `Greptile score >= 4/5` — if `greptile_score` is `null`: passed = true, note = `not reviewed by Greptile yet`. Otherwise passed = `greptile_score >= 4`, note = `<greptile_score>/5` (always, even when passed).
-5. `CircleCI tests present` — passed = `has_circleci_checks`. Note when not passed: `no CircleCI checks found on this PR`.
+5. `No high-severity Veria findings` — passed iff `veria` is `null` OR `veria.ran is false` OR `veria.high_count == 0`. Note: empty when `veria.ran is true` AND `veria.high_count == 0`; `not run by Veria yet` when `veria.ran is false`; `<N> high/critical finding(s) open` when failing; `Veria fetch failed` when `veria` is `null`.
+6. `CircleCI tests present` — passed = `has_circleci_checks`. Note when not passed: `no CircleCI checks found on this PR`.
 
-Note is empty (`""`) for items 1–3 when passed, and for item 5 when passed.
+Note is empty (`""`) for items 1–3 when passed, for item 5 only when `veria.ran is true` AND `veria.high_count == 0`, and for item 6 when passed.
 
 ## Step 6: write the verdict
 

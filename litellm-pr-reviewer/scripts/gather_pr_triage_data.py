@@ -59,6 +59,12 @@ _GREPTILE_SCORE_RE = re.compile(
 )
 _GREPTILE_SCORE_FALLBACK_RE = re.compile(r"\b([1-5])\s*/\s*5\b")
 _CIRCLECI_NAME_RE = re.compile(r"(^|/)circleci(\s*[:/]|\b)", re.IGNORECASE)
+_VERIA_LOGIN_RE = re.compile(r"^veria-ai(\[bot\])?$", re.IGNORECASE)
+_VERIA_FINDING_RE = re.compile(
+    r"^\s*\*\*(?P<severity>Critical|High|Medium|Low)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+_VERIA_HIGH_SEVERITIES = {"high", "critical"}
 
 PR_URL_RE = re.compile(
     r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)"
@@ -422,6 +428,86 @@ async def _fetch_greptile_score(
     return None
 
 
+async def _fetch_veria_findings(
+    client: httpx.AsyncClient,
+    token: str | None,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> dict | None:
+    """Veria AI security findings on a PR.
+
+    Returns:
+        {
+            "ran": bool,                 # has Veria commented on this PR at all
+            "high_count": int,           # # of High|Critical inline findings
+            "all_findings": [            # one per inline review comment
+                {"severity": str, "html_url": str},
+                ...
+            ],
+        }
+        or None on fetch error.
+
+    Veria posts in two shapes:
+      1. Issue comments — overall summary per run; headline severity is the
+         RUN's risk, not a per-finding signal. Used here only to detect
+         whether Veria has run at all.
+      2. PR review comments — one per finding, body starts with
+         "**<Severity>: <Title>**". Source of truth for high_count.
+
+    TODO: filter out findings whose review thread is resolved. The REST
+    /pulls/{n}/comments endpoint does not expose thread.is_resolved; needs
+    the GraphQL pullRequest.reviewThreads(first:N){nodes{isResolved}} query.
+    """
+    try:
+        issue_comments, review_comments = await asyncio.gather(
+            _gh_list(
+                client,
+                token,
+                f"/repos/{owner}/{repo}/issues/{pr_number}/comments",
+            ),
+            _gh_list(
+                client,
+                token,
+                f"/repos/{owner}/{repo}/pulls/{pr_number}/comments",
+            ),
+        )
+    except httpx.HTTPStatusError:
+        return None
+
+    def _is_veria(item: dict) -> bool:
+        login = (item.get("user") or {}).get("login") or ""
+        return bool(_VERIA_LOGIN_RE.match(login))
+
+    veria_issue_comments = [c for c in issue_comments or [] if _is_veria(c)]
+    veria_review_comments = [c for c in review_comments or [] if _is_veria(c)]
+
+    ran = bool(veria_issue_comments or veria_review_comments)
+
+    findings: list[dict] = []
+    for c in veria_review_comments:
+        body = c.get("body") or ""
+        m = _VERIA_FINDING_RE.search(body)
+        if not m:
+            continue
+        findings.append(
+            {
+                "severity": m.group("severity").capitalize(),
+                "html_url": c.get("html_url") or "",
+            }
+        )
+
+    high_count = sum(
+        1 for f in findings if f["severity"].lower() in _VERIA_HIGH_SEVERITIES
+    )
+
+    return {
+        "ran": ran,
+        "high_count": high_count,
+        "all_findings": findings,
+    }
+
+
 async def _noop_none() -> None:
     return None
 
@@ -440,7 +526,7 @@ async def gather(
     circleci_token: str | None,
 ) -> dict:
     async with httpx.AsyncClient() as client:
-        pr, diff_files, other_prs, greptile_score = await asyncio.gather(
+        pr, diff_files, other_prs, greptile_score, veria = await asyncio.gather(
             _gh(client, github_token, f"/repos/{owner}/{repo}/pulls/{pr_number}"),
             _fetch_diff(client, github_token, owner, repo, pr_number),
             _fetch_other_open_prs(
@@ -452,6 +538,7 @@ async def gather(
                 OTHER_PRS_SAMPLE_SIZE,
             ),
             _fetch_greptile_score(client, github_token, owner, repo, pr_number),
+            _fetch_veria_findings(client, github_token, owner, repo, pr_number),
         )
         head_sha = pr["head"]["sha"]
 
@@ -555,6 +642,7 @@ async def gather(
             "other_pr_numbers": [p["number"] for p in other_prs],
             "greptile_score": greptile_score,
             "has_circleci_checks": _has_circleci_checks(own_checks),
+            "veria": veria,
         }
 
 
