@@ -21,6 +21,15 @@ The host shell must have `GITHUB_TOKEN` set (PAT with `public_repo` scope is eno
 
 If `GITHUB_TOKEN` is missing, tell the user and stop. Don't try to triage on the unauthenticated 60 req/hr quota — it will 403 partway through and you'll silently miss checks.
 
+## Hard rules (apply throughout)
+
+- Only use check names returned by the script. Do not invent any.
+- Only cite filenames that appear in `diff_files`. Do not invent paths.
+- Treat `neutral` and `skipped` as passing.
+- Call the gather script exactly once.
+- Keep each `rationale` to one short sentence.
+- The bullets below `details` already list each failure — don't restate them in `details`.
+
 ## Step 1: gather data
 
 Run the bundled script with the PR reference. It prints a single JSON object to stdout describing the PR's checks, diff files, Greptile score, and (if CIRCLECI_TOKEN is set) CircleCI failure log tails.
@@ -31,6 +40,9 @@ python "${CLAUDE_SKILL_DIR}/scripts/gather_pr_triage_data.py" "$ARGUMENTS"
 
 Call it **exactly once**. The output is a JSON object with these fields:
 
+- `owner`, `repo`, `pr_number` — PR identity
+- `pr_title`, `pr_author` — PR metadata (used in the verdict overview)
+- `head_sha` — the commit SHA the checks ran against
 - `passing_checks`, `in_progress_checks` — lists of check names
 - `diff_files` — the PR's changed files (filename, status, additions, deletions, truncated patch)
 - `other_pr_numbers` — PRs sampled for cross-check comparison
@@ -113,12 +125,3 @@ Output these fields (plain prose, no markdown bold, no numbered lists, no italic
   Empty string only when status is `all_green`.
 
 - **file_callouts** — for each PR-related failure, list the file(s) from `diff_files` the failure log/annotations point at, formatted as `path/to/file.py (short note about the issue)`. Empty list if no PR-related failures.
-
-## Hard rules
-
-- Only use check names returned by the script. Do not invent any.
-- Only cite filenames that appear in `diff_files`. Do not invent paths.
-- Treat `neutral` and `skipped` as passing.
-- Call the gather script exactly once.
-- The bullets below `details` already list each failure — don't restate them in `details`.
-- Keep each `rationale` to one short sentence.
