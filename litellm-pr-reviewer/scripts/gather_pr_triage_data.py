@@ -62,6 +62,30 @@ _GH_ACTIONS_JOB_URL_RE = re.compile(
     r"/actions/runs/\d+/job/(?P<job_id>\d+)"
 )
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Failure-marker patterns used by `_extract_failure_window` to centre the
+# truncated log on the actual error rather than blind-tailing into post-job
+# runner cleanup. Order = priority (high signal first); the helper takes
+# the LAST match of the highest-priority pattern that hits. Tuned for the
+# two log shapes we ingest: GitHub Actions logs (each line prefixed with a
+# `2026-04-25T00:02:42.123Z ` timestamp) and CircleCI v1.1 step output
+# (no timestamp prefix). Hence we use a leading whitespace boundary
+# (\b on the keyword) instead of `^...` line anchors — the latter would
+# miss every match in Actions logs because the timestamp eats the start.
+#
+# `Exception:` and `Traceback` are restricted to the Python form (capital
+# E, exact phrase) so we don't match arbitrary log lines that mention the
+# word "exception" in prose. `FAILED ` requires a trailing space to stay
+# anchored on the pytest `FAILED tests/foo.py::test_bar` summary shape.
+# `##[error]` is GitHub Actions specific. `Error:` / `error:` are generic
+# fallbacks for lint/build tools that don't raise Python exceptions.
+_FAILURE_MARKERS = (
+    re.compile(r"\bTraceback \(most recent call last\):"),
+    re.compile(r"(?<!\S)Exception:"),
+    re.compile(r"(?<!\S)FAILED "),
+    re.compile(r"##\[error\]"),
+    re.compile(r"(?<!\S)Error:"),
+    re.compile(r"(?<!\S)error:"),
+)
 _GREPTILE_LOGIN_RE = re.compile(r"greptile", re.IGNORECASE)
 _GREPTILE_SCORE_RE = re.compile(
     r"confidence\s*score[^0-9]{0,10}([1-5])\s*/\s*5", re.IGNORECASE
@@ -94,6 +118,57 @@ _POLICY_META_CHECK_SUBSTRINGS = (
 def _is_policy_meta_check(name: str) -> bool:
     n = name.lower()
     return any(s in n for s in _POLICY_META_CHECK_SUBSTRINGS)
+
+
+def _extract_failure_window(text: str, max_chars: int = MAX_LOG_CHARS) -> str:
+    """Truncate `text` to `max_chars` centred on the LAST high-signal failure
+    marker, falling back to plain tail-truncation when no marker is found.
+
+    Why this exists: GitHub Actions and CircleCI logs have ~100KB+ of post-job
+    runner cleanup (git config --unset, artifact upload, orphan-process
+    sweep) that runs AFTER the actual test/build failure. A naive
+    `text[-max_chars:]` slice on a 250KB pytest log discards the
+    `Exception: Keys not documented in ...` diagnostic and hands the
+    classifier 3KB of `git submodule foreach --recursive ...` lines, which
+    look exactly like noise unrelated to the diff. Concrete repro on
+    BerriAI/litellm PR #26460: the `documentation` check's failure was at
+    byte 49,740 of a 248,741-byte log; the last 3,000 chars contained zero
+    mention of the test that actually failed, so the triage agent
+    classified it as unrelated.
+
+    Strategy: walk the markers in priority order (Exception > Traceback >
+    FAILED > ##[error] > Error: > error:); for the first pattern that has
+    any match, slice a `max_chars`-wide window starting ~200 chars before
+    the LAST match. We use the last match because pytest's Exception lines
+    sit AFTER the rest of the test output (so we want context above), and
+    in multi-step jobs the last failure is typically the one that took the
+    job down before cleanup. The 200-char lookback gives the model a
+    little context above the marker (e.g. the `File "...py", line N` line
+    above a `Traceback`).
+
+    No marker hit → fall back to `text[-max_chars:]` so we degrade
+    identically to the previous behavior on logs that genuinely have no
+    structured failure signal.
+    """
+    if len(text) <= max_chars:
+        return text
+    for marker in _FAILURE_MARKERS:
+        matches = list(marker.finditer(text))
+        if not matches:
+            continue
+        last = matches[-1]
+        # 200-char lookback: enough to catch the `File "...", line N, in <module>`
+        # frame above a `Traceback`/`Exception`, small enough to leave room
+        # for the failure body + a chunk of stack/runner output below.
+        start = max(0, last.start() - 200)
+        end = min(len(text), start + max_chars)
+        prefix = "...[truncated]\n" if start > 0 else ""
+        suffix = "\n...[truncated]" if end < len(text) else ""
+        return f"{prefix}{text[start:end]}{suffix}"
+    # No structured failure marker — fall back to plain tail truncation so
+    # callers see the same shape as before for marker-less logs (e.g. infra
+    # 500 errors that just log a stack-less HTTP failure).
+    return "...[truncated]\n" + text[-max_chars:]
 
 PR_URL_RE = re.compile(
     r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)"
@@ -336,9 +411,7 @@ async def _fetch_v11_failure_log(
             text = _ANSI_ESCAPE_RE.sub("", text)
             if not text.strip():
                 continue
-            if len(text) > MAX_LOG_CHARS:
-                text = "...[truncated]\n" + text[-MAX_LOG_CHARS:]
-            return text
+            return _extract_failure_window(text)
     return None
 
 
@@ -392,9 +465,10 @@ async def _fetch_actions_job_log(
           `actions:read` on the target org, or use a PAT belonging to a
           repo admin.
 
-    Returns the last MAX_LOG_CHARS chars of the log (the failure tail) on
-    success, None otherwise. Tail-truncation matches the CircleCI fetcher
-    so the model sees the same shape from both sources.
+    Returns a MAX_LOG_CHARS-wide window centred on the last high-signal
+    failure marker (see `_extract_failure_window`) on success, None
+    otherwise. The window strategy matches the CircleCI fetcher so the
+    model sees the same shape from both sources.
     """
     if not html_url:
         return None
@@ -434,9 +508,7 @@ async def _fetch_actions_job_log(
     text = _ANSI_ESCAPE_RE.sub("", text)
     if not text.strip():
         return None
-    if len(text) > MAX_LOG_CHARS:
-        text = "...[truncated]\n" + text[-MAX_LOG_CHARS:]
-    return text
+    return _extract_failure_window(text)
 
 
 # --------------------------------------------------------------------------- #
