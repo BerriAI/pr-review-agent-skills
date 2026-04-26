@@ -52,6 +52,15 @@ _CIRCLECI_LEGACY_URL_RE = re.compile(
     r"https?://circleci\.com/(?:gh|github)/"
     r"(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?P<build_num>\d+)"
 )
+# GitHub Actions check-run html_url shape:
+#   https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
+# Anchored on `/actions/runs/.../job/...` so we don't false-positive on
+# CircleCI URLs or other check html_urls (Greptile, GitGuardian, etc.).
+_GH_ACTIONS_JOB_URL_RE = re.compile(
+    r"https?://github\.com/"
+    r"(?P<owner>[^/]+)/(?P<repo>[^/]+)"
+    r"/actions/runs/\d+/job/(?P<job_id>\d+)"
+)
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _GREPTILE_LOGIN_RE = re.compile(r"greptile", re.IGNORECASE)
 _GREPTILE_SCORE_RE = re.compile(
@@ -59,6 +68,32 @@ _GREPTILE_SCORE_RE = re.compile(
 )
 _GREPTILE_SCORE_FALLBACK_RE = re.compile(r"\b([1-5])\s*/\s*5\b")
 _CIRCLECI_NAME_RE = re.compile(r"(^|/)circleci(\s*[:/]|\b)", re.IGNORECASE)
+
+# Policy/meta checks that operate on PR shape (branch source, signed commits,
+# CLA, etc.) instead of code. They CAN block merge but their failure tells
+# the reviewer nothing about whether the diff is sound, so the triage
+# agent should always bucket them as `unrelated_failures`. Pre-flagging
+# them in gather output (rather than relying on the model's classifier)
+# kills the false-positive #26419 surfaced: a UI-dropdown PR was marked
+# pr_related because "Verify PR source branch" failed.
+#
+# Match is case-insensitive substring against the check name. Add new
+# entries here when a repo's policy infra introduces another such check.
+_POLICY_META_CHECK_SUBSTRINGS = (
+    "verify pr source branch",
+    "dco",
+    "cla/cla-bot",
+    "cla-assistant",
+    "license/cla",
+    "signed-off-by",
+    "semantic-pull-request",
+    "semantic pull request",
+)
+
+
+def _is_policy_meta_check(name: str) -> bool:
+    n = name.lower()
+    return any(s in n for s in _POLICY_META_CHECK_SUBSTRINGS)
 
 PR_URL_RE = re.compile(
     r"github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)"
@@ -328,6 +363,82 @@ async def _fetch_circleci_failure_log(
     )
 
 
+async def _fetch_actions_job_log(
+    client: httpx.AsyncClient,
+    github_token: str | None,
+    html_url: str | None,
+) -> str | None:
+    """Fetch the tail of a GitHub Actions job log given its check-run html_url.
+
+    GitHub's `output.text` field on a check-run is almost always empty for
+    Actions jobs (the runner doesn't populate it — annotations are the only
+    structured surface, and annotations only fire on explicit `::error::`
+    workflow commands). Tools like `black`, `ruff`, `pytest` exit non-zero
+    via stdout instead, so the actual diagnostic ("would reformat
+    .../foo.py", "1 failed in 0.5s", etc.) only lives in the rendered job
+    logs. Mirror of `_fetch_circleci_failure_log` but for Actions.
+
+    Endpoint: `GET /repos/{o}/{r}/actions/jobs/{job_id}/logs`
+        - 302-redirects to a presigned blob URL on pipelines.actions.
+          githubusercontent.com — we follow the redirect and read it as
+          plain text.
+        - Docs claim "anyone with read access" suffices, but in practice
+          GitHub returns 403 ("Must have admin rights to Repository") for
+          non-admin tokens on many public repos. That's a long-standing
+          GitHub quirk, not a bug here. Returns None on any non-200 so the
+          gather pipeline degrades gracefully — caller behavior stays
+          identical to the old (annotations-only) path. To unlock this for
+          a given repo at deploy time: install a GitHub App with
+          `actions:read` on the target org, or use a PAT belonging to a
+          repo admin.
+
+    Returns the last MAX_LOG_CHARS chars of the log (the failure tail) on
+    success, None otherwise. Tail-truncation matches the CircleCI fetcher
+    so the model sees the same shape from both sources.
+    """
+    if not html_url:
+        return None
+    m = _GH_ACTIONS_JOB_URL_RE.search(html_url)
+    if not m:
+        return None
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    # Auth is optional per GitHub docs for public repos, but we always send
+    # GITHUB_TOKEN when available so private repos work + we get the higher
+    # 5000/hr rate-limit bucket instead of the 60/hr unauth quota.
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    url = (
+        f"{GITHUB_API}/repos/{m['owner']}/{m['repo']}"
+        f"/actions/jobs/{m['job_id']}/logs"
+    )
+    try:
+        # follow_redirects=True is critical: the API returns 302 to a
+        # presigned blob URL. Without it httpx returns the 302 and we get
+        # nothing useful.
+        r = await client.get(
+            url,
+            headers=headers,
+            follow_redirects=True,
+            timeout=30.0,
+        )
+    except httpx.HTTPError:
+        return None
+    if r.status_code != 200:
+        return None
+    text = r.text
+    # Strip ANSI color codes the same way the CircleCI fetcher does — the
+    # model wastes context budget reading escape sequences otherwise.
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    if not text.strip():
+        return None
+    if len(text) > MAX_LOG_CHARS:
+        text = "...[truncated]\n" + text[-MAX_LOG_CHARS:]
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # PR-level fetches                                                             #
 # --------------------------------------------------------------------------- #
@@ -431,6 +542,28 @@ async def _noop_none() -> None:
 # --------------------------------------------------------------------------- #
 
 
+async def _fetch_pr_with_mergeable(
+    client: httpx.AsyncClient,
+    token: str | None,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> dict:
+    """Fetch a PR, retrying once if `mergeable` is null.
+
+    GitHub computes `mergeable` lazily on the first PR fetch — the initial
+    response is often `null` while a background job runs the merge test. A
+    single retry after a short pause is the documented pattern. If it stays
+    null after the retry we give up and let downstream treat it as unknown
+    (better than blocking the whole triage on a slow background job).
+    """
+    pr = await _gh(client, token, f"/repos/{owner}/{repo}/pulls/{pr_number}")
+    if pr.get("mergeable") is None:
+        await asyncio.sleep(1.5)
+        pr = await _gh(client, token, f"/repos/{owner}/{repo}/pulls/{pr_number}")
+    return pr
+
+
 async def gather(
     owner: str,
     repo: str,
@@ -441,7 +574,9 @@ async def gather(
 ) -> dict:
     async with httpx.AsyncClient() as client:
         pr, diff_files, other_prs, greptile_score = await asyncio.gather(
-            _gh(client, github_token, f"/repos/{owner}/{repo}/pulls/{pr_number}"),
+            _fetch_pr_with_mergeable(
+                client, github_token, owner, repo, pr_number
+            ),
             _fetch_diff(client, github_token, owner, repo, pr_number),
             _fetch_other_open_prs(
                 client,
@@ -454,6 +589,25 @@ async def gather(
             _fetch_greptile_score(client, github_token, owner, repo, pr_number),
         )
         head_sha = pr["head"]["sha"]
+        # `mergeable`: true | false | null (still computing). `mergeable_state`
+        # adds nuance: "dirty" = conflicts, "blocked" = required review/check
+        # missing, "behind" = base moved, "clean"/"unstable" = mergeable. We
+        # surface both so downstream can treat null as "unknown" (don't block)
+        # while false/dirty is a hard merge-conflict signal.
+        #
+        # ALREADY-MERGED override: GitHub keeps recomputing `mergeable` against
+        # current main even after a PR is merged, so a months-old merged PR
+        # whose head no longer fast-forwards into HEAD comes back as
+        # mergeable=false / state=dirty. That is meaningless — the PR shipped
+        # cleanly at merge time. Without this override the conflict-blocker
+        # rubric (weight 5) flipped already-merged PRs to BLOCKED 0/5 (eval
+        # @ 22:30 UTC: PR #26467 of BerriAI/litellm). For closed-merged PRs
+        # we force the clean-merge signal so the rubric ignores the ghost.
+        mergeable = pr.get("mergeable")
+        mergeable_state = pr.get("mergeable_state")
+        if pr.get("state") == "closed" and pr.get("merged_at"):
+            mergeable = True
+            mergeable_state = "clean"
 
         own_checks_task = _all_checks(client, github_token, owner, repo, head_sha)
         other_checks_tasks = [
@@ -477,7 +631,11 @@ async def gather(
                 in_progress.append(r["name"])
 
         if failing_runs:
-            annotations_per, circleci_logs_per = await asyncio.gather(
+            (
+                annotations_per,
+                circleci_logs_per,
+                actions_logs_per,
+            ) = await asyncio.gather(
                 asyncio.gather(
                     *[
                         _fetch_annotations(
@@ -498,14 +656,30 @@ async def gather(
                         for r in failing_runs
                     ]
                 ),
+                # GitHub Actions log tails. Same shape as the CircleCI
+                # branch (returns None when the URL isn't an Actions one,
+                # or when the API returns 403 because the token lacks
+                # admin rights — see _fetch_actions_job_log docstring).
+                # The regex inside the fetcher silently no-ops on
+                # non-Actions URLs (Greptile, GitGuardian, etc.) so we
+                # can hand it every failing check unconditionally.
+                asyncio.gather(
+                    *[
+                        _fetch_actions_job_log(
+                            client, github_token, r.get("html_url")
+                        )
+                        for r in failing_runs
+                    ]
+                ),
             )
         else:
             annotations_per = []
             circleci_logs_per = []
+            actions_logs_per = []
 
         failure_contexts: list[dict] = []
-        for r, ann_list, cci_log in zip(
-            failing_runs, annotations_per, circleci_logs_per
+        for r, ann_list, cci_log, gha_log in zip(
+            failing_runs, annotations_per, circleci_logs_per, actions_logs_per
         ):
             name = r["name"]
             output = r.get("output") or {}
@@ -518,6 +692,17 @@ async def gather(
                     if text
                     else f"--- CircleCI raw log tail ---\n{cci_log}"
                 )
+            # Splice GitHub Actions log tail under its own header so the
+            # model can tell sources apart at a glance — matches the
+            # CircleCI splicing pattern verbatim. Only one of cci_log /
+            # gha_log fires per check by construction (the URL regexes
+            # are mutually exclusive), so there's no double-tail risk.
+            if gha_log:
+                text = (
+                    f"{text}\n\n--- GitHub Actions raw log tail ---\n{gha_log}"
+                    if text
+                    else f"--- GitHub Actions raw log tail ---\n{gha_log}"
+                )
             other_status: list[dict] = []
             for p, p_checks in zip(other_prs, other_checks):
                 match = next((c for c in p_checks if c["name"] == name), None)
@@ -529,6 +714,17 @@ async def gather(
                         "conclusion": (match or {}).get("conclusion"),
                     }
                 )
+            # Pre-derived "also red on a neighbor PR" boolean. The model
+            # was unreliable at computing this from other_prs at output
+            # time (eval @ 22:26 UTC: only 1/7 cases populated correctly),
+            # so do it here in pure Python and let the model just copy
+            # the answer through. Treats only conclusive failures as
+            # signal — `null` (didn't run / pending) is NOT counted as
+            # "failing" because we can't tell which.
+            also_failing_elsewhere = any(
+                p.get("conclusion") in ("failure", "timed_out", "cancelled")
+                for p in other_status
+            )
             failure_contexts.append(
                 {
                     "check_name": name,
@@ -538,6 +734,15 @@ async def gather(
                     "annotations": ann_list,
                     "html_url": r.get("html_url"),
                     "other_prs": other_status,
+                    # Pre-classified meta/policy bucket. SKILL.md Step 2
+                    # tells the model: is_policy_meta=true → ALWAYS
+                    # related_to_pr_diff=false. Removes the model's
+                    # ability to false-positive on PR-shape checks.
+                    "is_policy_meta": _is_policy_meta_check(name),
+                    # Pre-derived for the rubric's unique-vs-elsewhere
+                    # split. True iff this same check is conclusively
+                    # failing on at least one sampled neighbor PR.
+                    "also_failing_on_other_prs": also_failing_elsewhere,
                 }
             )
 
@@ -555,6 +760,8 @@ async def gather(
             "other_pr_numbers": [p["number"] for p in other_prs],
             "greptile_score": greptile_score,
             "has_circleci_checks": _has_circleci_checks(own_checks),
+            "mergeable": mergeable,
+            "mergeable_state": mergeable_state,
         }
 
 
