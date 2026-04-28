@@ -163,16 +163,38 @@ Sections you should **not** act on:
 - `_Unrelated failures_` — flagged as infra/cross-PR by the bot. Pushing won't fix them.
 - `_Policy / meta failures_` — DCO, source-branch, CLA. Tell the user verbatim what the rationale says (it's already specific) and stop unless the user asked you to handle policy too. These never dock score so the loop can finish READY with one of these still red.
 - `_Tech debt (FYI, not blocking)_` — explicitly non-blocking by name.
-- `_Still running_` — wait, don't act.
+- `_Still running_` — see "Pending state taxonomy" below; wait, don't act.
+
+### B.5. Pending state taxonomy (CI vs Greptile)
+
+Two distinct things can be "pending", and the loop must treat them differently — pushing a new commit makes the wait *longer*, not shorter:
+
+| Pending signal | Where it shows up | What `score` looks like | What `verdict` looks like | Loop action |
+|---|---|---|---|---|
+| **CI checks still running** | `_Still running_` section in drilldown is non-empty; verdict one-liner says `N check(s) still running: foo, bar` | provisional, may be 5/5 anyway | always `WAITING` (overrides score) | **wait, don't push.** Pushing resets `head_sha` and restarts every check. |
+| **Greptile hasn't reviewed yet** | Justification prose contains `Greptile pending` or `Greptile has not reviewed this PR yet`; `greptile_score` is null in the underlying data | docked 1 (capped at 4/5) | usually `BLOCKED` (because score < 5) | **wait, don't push** unless other blockers also exist. Greptile lands on its own schedule once the PR is non-draft and CI is green; pushing doesn't speed it up. You *can* nudge it by leaving an `@greptile review` comment on the PR if it has been > 10 min and the score still hasn't landed. |
+| **Both** | Both signals present | provisional + docked 1 | `WAITING` | wait. CI must finish before Greptile starts on most setups. |
+
+How to detect each from the parsed card + drilldown:
+
+```bash
+# CI still running:
+CI_RUNNING=$(echo "$DRILLDOWN" | awk '/^_Still running_$/,/^_/' | grep -c '^  • ' || echo 0)
+# Greptile pending:
+GREPTILE_PENDING=$(echo "$CARD" | grep -ciE 'greptile (pending|has not reviewed)' || echo 0)
+```
+
+Polling cadence when waiting: re-ask the bot every 60s for CI (checks usually finish in 5–15 min on this repo), every 120s for Greptile (typical landing is 2–10 min after CI goes green). Cap the wait at **15 min total per iteration**; if pending persists past that, stop and tell the user — something is stuck server-side and the loop can't unstick it.
 
 ### C. Check exit conditions
 
 Stop the loop and report when **any** are true:
 
 - `SCORE == 5` AND `VERDICT == READY` AND there are zero entries in `_PR-related failures_` / `_Pattern findings_ [blocker|risk=high]` / `_Scope drift_` / `_Prior signals_ ⚠️` / `_Karpathy_ no`.
-- `VERDICT == WAITING` AND no fixable items in the drilldown — wait one polling cycle, then re-check. If still WAITING with no fixable items after 2 cycles, stop and tell the user CI is still running.
-- Iteration count == 5.
-- Two consecutive iterations produce identical drilldown bullets — you're not making progress, surface the remaining issues and stop.
+- `VERDICT == WAITING` AND no other fixable items in the drilldown — enter the wait loop above. Resume normal iteration when CI finishes; stop with a "still waiting after 15 min" report if it doesn't.
+- `VERDICT == BLOCKED` AND the **only** remaining penalty is `Greptile pending` — enter the wait loop. Don't push, don't re-trigger; just re-ask. If Greptile hasn't landed after 15 min, optionally post `@greptile review` on the PR (one shot only — never spam) and wait one more cycle, then stop.
+- Iteration count == 5 (push iterations only — wait cycles don't count toward this).
+- Two consecutive **post-fix** drilldown bullets are identical — you're not making progress, surface the remaining issues and stop.
 
 ### D. Fix the named blockers
 
@@ -267,4 +289,22 @@ litellm-loop stopped after 5 iterations.
       — guard added at sink, not source (source: code,
         citation: litellm/proxy/auth/handle_jwt.py:142)
   Last bot reply: <link to thread>
+```
+
+Stuck waiting:
+
+```
+litellm-loop paused — pending signals haven't cleared after 15 min.
+  PR:          https://github.com/BerriAI/litellm/pull/26500
+  Iterations:  1 push, 8 wait cycles
+  Score:       4/5 (provisional — Greptile pending docks 1)
+  Verdict:     ❌ BLOCKED
+  Fixed:       1 item (see commit a1b2c3d)
+  Remaining:
+    - Greptile has not reviewed this PR yet
+      (posted `@greptile review` once at +15min, no response by +30min)
+  Notes:       1 unrelated CircleCI failure (`build_and_test 3.13`) — also
+               red on PRs #26385 and #26011, infra-wide noise.
+  Next step:   wait for Greptile to land on its own schedule, or ping
+               @greptile-bot in the PR. Re-run /litellm-loop once it scores.
 ```

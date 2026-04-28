@@ -62,10 +62,19 @@ You need **at least one** of `LITELLM_BOT_URL` or `SLACK_WEBHOOK_URL`. If both a
 The bot's verdict is the **only source of truth**. The skill never fabricates a 5/5 to short-circuit. Specifically, it stops when:
 
 - `score == 5` AND `verdict == READY` AND zero blocking entries in the drilldown, **or**
-- iteration cap hit (default 5), **or**
-- two consecutive iterations produce identical drilldown bullets (you're not making progress, or the bot has flagged something un-fixable from inside the diff like wide-fanout maintainability risk).
+- iteration cap hit (default 5 push iterations — wait cycles don't count), **or**
+- two consecutive **post-fix** iterations produce identical drilldown bullets (you're not making progress, or the bot has flagged something un-fixable from inside the diff like wide-fanout maintainability risk).
 
-`WAITING` (CI still running) is treated as "wait one polling cycle, then re-check" — it's not a stop condition unless nothing else is fixable and the wait persists.
+### Pending states are not stop conditions, but they're not push conditions either
+
+Two distinct things can be "pending", and the loop waits instead of pushing in both cases (pushing resets `head_sha` and restarts the wait):
+
+| Pending signal | Where to spot it | Loop behavior |
+|---|---|---|
+| **CI checks still running** | `_Still running_` section in drilldown is non-empty; verdict is `WAITING` | Re-ask every 60s, cap at 15 min/iteration. |
+| **Greptile hasn't reviewed yet** | Card prose contains `Greptile pending` / `Greptile has not reviewed this PR yet`; the bot docks 1 from the score so verdict is usually `BLOCKED` even on otherwise-clean PRs | Re-ask every 120s, cap at 15 min/iteration. After the first 15 min, optionally post `@greptile review` on the PR (one shot only — never spam), then wait one more cycle. |
+
+If the only remaining penalty after fixes is `Greptile pending`, the loop will sit in the wait state rather than push — a new commit just delays Greptile further. If the wait caps out, the loop stops with a "still pending after 15 min" report and lets the user decide.
 
 ## What it intentionally does **not** fix
 

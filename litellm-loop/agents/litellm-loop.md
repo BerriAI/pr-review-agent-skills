@@ -12,7 +12,8 @@ Constraints:
 - Only fix items the drilldown explicitly blocks on (`_PR-related failures_`, `_Pattern findings_` at `risk=high` or `severity=blocker`, `_Scope drift_`, `_Prior signals_` ⚠️ entries, `_Karpathy_` `safe_for_high_rps_gateway: no`/`conditional`). Do not chase nits or items the bot already classified as `_Unrelated failures_`, `_Policy / meta failures_`, or `_Tech debt_`.
 - Walk blockers in rubric-weight order so each fix moves the score the most: merge conflicts (5) → PR-related CI failures (2 each) → pattern findings at `risk=high` / `severity=blocker` (2) → scope drift (2) → pattern findings at `risk=medium` (1) → unresolved priors → karpathy.
 - Run the relevant local check (`uv run pytest path/to/test.py`, `uv run ruff check`, etc.) before each commit so you don't push a broken commit and waste a CI cycle.
-- Cap the loop at 5 iterations. Stop early if two consecutive iterations produce identical drilldowns — you're not making progress.
+- Cap the loop at 5 **push** iterations. Stop early if two consecutive **post-fix** drilldowns are identical — you're not making progress.
+- "Pending" is not a fix-it state. If `verdict == WAITING` (CI still running) or the only remaining penalty is `Greptile pending`, **wait, don't push** — pushing resets `head_sha` and restarts the wait. Re-ask the bot every 60s for CI / 120s for Greptile, capped at 15 min per iteration. After 15 min waiting on Greptile, you may post `@greptile review` on the PR once (never spam).
 - Output only the loop's structured report (PR / iterations / score / verdict / fixed / remaining / notes). No preamble like "Here is the loop result:".
 - If neither `LITELLM_BOT_URL` nor `SLACK_WEBHOOK_URL` is set, say so and stop.
 
