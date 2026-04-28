@@ -12,10 +12,14 @@ Required env:
                      public repos but strongly recommended (60 req/hr without).
 
 Optional env:
-    CIRCLECI_TOKEN - CircleCI project or personal token. When set, raw
+    LITELLM_API_BASE + LITELLM_API_KEY - When BOTH are set, raw CircleCI
                      failure log tails are spliced in for failing CircleCI
-                     jobs; without it, only GitHub's check-run summary is
-                     used.
+                     jobs by calling the `circle_ci_mcp-get_build_failure_logs`
+                     tool on the LiteLLM proxy's MCP endpoint
+                     (`{LITELLM_API_BASE}/mcp/`). The proxy holds the
+                     CircleCI credential, so this script never sees a
+                     CircleCI token. Without these vars, the script falls
+                     back to GitHub's check-run summary alone.
 
 Usage:
     python gather_pr_triage_data.py https://github.com/owner/repo/pull/123
@@ -38,20 +42,10 @@ from typing import Any
 import httpx
 
 GITHUB_API = "https://api.github.com"
-CIRCLECI_V11 = "https://circleci.com/api/v1.1"
 OTHER_PRS_SAMPLE_SIZE = 3
 MAX_PATCH_CHARS = 2000
 MAX_LOG_CHARS = 3000
 
-_CIRCLECI_JOB_URL_RE = re.compile(
-    r"https?://app\.circleci\.com/pipelines/(?:gh|github)/"
-    r"(?P<owner>[^/]+)/(?P<repo>[^/]+)"
-    r"/\d+/workflows/[^/]+/jobs/(?P<build_num>\d+)"
-)
-_CIRCLECI_LEGACY_URL_RE = re.compile(
-    r"https?://circleci\.com/(?:gh|github)/"
-    r"(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?P<build_num>\d+)"
-)
 # GitHub Actions check-run html_url shape:
 #   https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}
 # Anchored on `/actions/runs/.../job/...` so we don't false-positive on
@@ -368,72 +362,118 @@ async def _fetch_annotations(
     return out
 
 
-async def _fetch_v11_failure_log(
-    client: httpx.AsyncClient,
-    circleci_token: str,
-    owner: str,
-    repo: str,
-    build_num: int,
-) -> str | None:
-    """Fetch the failing step's log tail for a single CircleCI v1.1 build."""
-    headers = {"Circle-Token": circleci_token, "Accept": "application/json"}
-    try:
-        r = await client.get(
-            f"{CIRCLECI_V11}/project/github/{owner}/{repo}/{build_num}",
-            headers=headers,
-            timeout=30.0,
-        )
-        r.raise_for_status()
-        build = r.json()
-    except (httpx.HTTPError, ValueError):
-        return None
+class _LiteLLMMcp:
+    """Minimal MCP (Streamable HTTP) client for the LiteLLM proxy.
 
-    for step in build.get("steps") or []:
-        for action in step.get("actions") or []:
-            if action.get("status") not in (
-                "failed",
-                "timedout",
-                "infrastructure_fail",
-            ):
-                continue
-            output_url = action.get("output_url")
-            if not output_url:
+    Why a hand-rolled client instead of `mcp.client`: we need exactly one
+    tool (`circle_ci_mcp-get_build_failure_logs`) per failing CircleCI
+    check-run, the proxy is stateless (no session id required), and the
+    full SDK would pull in extra runtime deps for a 30-line JSON-RPC POST.
+    The proxy returns SSE-framed responses (one `data: {...}` line per
+    JSON-RPC reply) — we parse those by hand.
+
+    Endpoint URL trailing slash: `/mcp` 307-redirects to `/mcp/`. We pin
+    the trailing slash so we save a redirect on every call.
+    """
+
+    def __init__(self, base_url: str, api_key: str) -> None:
+        self.url = base_url.rstrip("/") + "/mcp/"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "x-litellm-api-key": f"Bearer {api_key}",
+        }
+
+    async def call_tool(
+        self,
+        client: httpx.AsyncClient,
+        name: str,
+        arguments: dict,
+    ) -> dict | None:
+        """POST a `tools/call` and return the parsed result, or None on error.
+
+        Returns None — never raises — so callers degrade identically to
+        the pre-MCP path (no log tail spliced) if the proxy is down,
+        the tool 500s, or the response shape is unexpected.
+        """
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        try:
+            r = await client.post(
+                self.url, headers=self.headers, json=body, timeout=60.0
+            )
+            r.raise_for_status()
+        except httpx.HTTPError:
+            return None
+        for line in r.text.splitlines():
+            if not line.startswith("data: "):
                 continue
             try:
-                lr = await client.get(output_url, timeout=30.0)
-                lr.raise_for_status()
-                parts = lr.json()
-            except (httpx.HTTPError, ValueError):
+                obj = json.loads(line[len("data: "):])
+            except ValueError:
                 continue
-            text = "\n".join(
-                (p.get("message") or "") for p in parts if isinstance(p, dict)
-            )
-            text = _ANSI_ESCAPE_RE.sub("", text)
-            if not text.strip():
-                continue
-            return _extract_failure_window(text)
-    return None
+            if "error" in obj:
+                return None
+            res = obj.get("result")
+            if isinstance(res, dict):
+                return res
+        return None
+
+
+# Truncation-warning prelude that the upstream CircleCI MCP server prepends
+# when its log slice exceeds an internal cap. We strip it before passing the
+# body to `_extract_failure_window` so the marker centring isn't fooled by
+# the warning text. See:
+# https://github.com/CircleCI-Public/mcp-server-circleci
+_MCP_TRUNCATION_PRELUDE_RE = re.compile(
+    r"^\s*<MCPTruncationWarning>.*?</MCPTruncationWarning>\s*",
+    re.DOTALL,
+)
 
 
 async def _fetch_circleci_failure_log(
     client: httpx.AsyncClient,
-    circleci_token: str,
+    mcp: _LiteLLMMcp | None,
     html_url: str | None,
 ) -> str | None:
-    if not html_url:
+    """Fetch the failing-step log tail for a CircleCI build via the LiteLLM
+    MCP proxy.
+
+    Hands the GitHub status `target_url` straight to the upstream
+    `circle_ci_mcp-get_build_failure_logs` tool — that tool already
+    handles all five CircleCI URL shapes (project / pipeline / workflow
+    / job / legacy) so we don't parse them ourselves. Returns the
+    failure-window-extracted log tail (same shape as the GitHub Actions
+    fetcher) or None if `mcp` is unset, the URL isn't a CircleCI URL,
+    or the call fails.
+    """
+    if mcp is None or not html_url:
         return None
-    m = _CIRCLECI_JOB_URL_RE.search(html_url) or _CIRCLECI_LEGACY_URL_RE.search(
-        html_url
-    )
-    if not m:
+    if "circleci.com" not in html_url:
         return None
-    return await _fetch_v11_failure_log(
+    res = await mcp.call_tool(
         client,
-        circleci_token,
-        m["owner"],
-        m["repo"],
-        int(m["build_num"]),
+        "circle_ci_mcp-get_build_failure_logs",
+        {"params": {"projectURL": html_url}},
     )
+    if not res or res.get("isError"):
+        return None
+    parts = []
+    for c in res.get("content") or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            parts.append(c.get("text") or "")
+    text = "\n".join(parts).strip()
+    if not text:
+        return None
+    text = _MCP_TRUNCATION_PRELUDE_RE.sub("", text)
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    if not text.strip():
+        return None
+    return _extract_failure_window(text)
 
 
 async def _fetch_actions_job_log(
@@ -642,7 +682,7 @@ async def gather(
     pr_number: int,
     *,
     github_token: str | None,
-    circleci_token: str | None,
+    mcp: _LiteLLMMcp | None,
 ) -> dict:
     async with httpx.AsyncClient() as client:
         pr, diff_files, other_prs, greptile_score = await asyncio.gather(
@@ -720,9 +760,9 @@ async def gather(
                     *[
                         (
                             _fetch_circleci_failure_log(
-                                client, circleci_token, r.get("html_url")
+                                client, mcp, r.get("html_url")
                             )
-                            if circleci_token
+                            if mcp is not None
                             else _noop_none()
                         )
                         for r in failing_runs
@@ -860,11 +900,25 @@ def main() -> None:
         sys.exit(2)
 
     gh_token = os.environ.get("GITHUB_TOKEN") or None
-    cci_token = os.environ.get("CIRCLECI_TOKEN") or None
     if not gh_token:
         print(
             "warning: GITHUB_TOKEN not set; using unauthenticated GitHub API "
             "(60 req/hr limit; expect 403 on busy repos).",
+            file=sys.stderr,
+        )
+
+    litellm_base = os.environ.get("LITELLM_API_BASE")
+    litellm_key = os.environ.get("LITELLM_API_KEY")
+    mcp = (
+        _LiteLLMMcp(litellm_base, litellm_key)
+        if litellm_base and litellm_key
+        else None
+    )
+    if mcp is None:
+        print(
+            "warning: LITELLM_API_BASE/LITELLM_API_KEY not set; CircleCI "
+            "failure log tails will be omitted (GitHub check-run summaries "
+            "still included).",
             file=sys.stderr,
         )
 
@@ -875,7 +929,7 @@ def main() -> None:
                 repo,
                 pr_number,
                 github_token=gh_token,
-                circleci_token=cci_token,
+                mcp=mcp,
             )
         )
     except httpx.HTTPStatusError as exc:

@@ -10,7 +10,7 @@ Given a single PR URL, the skill:
 
 1. Pulls all check-runs and classic statuses on the PR HEAD (paginated — busy repos with 40+ checks were silently truncating before).
 2. Bundles the diff (truncated patches), the latest Greptile score, and the same checks' status on the 3 most recently updated other open PRs (for cross-comparison).
-3. For each failing check, fetches GitHub annotations and — if `CIRCLECI_TOKEN` is set — splices in the raw CircleCI failure log tail.
+3. For each failing check, fetches GitHub annotations and — if `LITELLM_API_BASE` + `LITELLM_API_KEY` are set — splices in the raw CircleCI failure log tail (fetched via the LiteLLM proxy's `circle_ci_mcp-get_build_failure_logs` MCP tool, so no CircleCI token is needed locally).
 4. Hands the bundle to the LLM, which decides per-check whether the failure is the PR's fault or pre-existing/infra, and emits a structured verdict.
 
 ## Install
@@ -46,7 +46,7 @@ Or just describe what you want — Claude will load the skill automatically when
 | Variable | Required | Purpose |
 |---|---|---|
 | `GITHUB_TOKEN` | yes | PAT with `public_repo` scope (or `repo` for private repos). Without it, GitHub's 60 req/hr limit will 403 partway through. |
-| `CIRCLECI_TOKEN` | no | CircleCI project token (`CCIPRJ_…`) or PAT. When set, the script pulls raw CircleCI failure log tails so the LLM can see what actually broke instead of just GitHub's truncated summary. |
+| `LITELLM_API_BASE` + `LITELLM_API_KEY` | no | LiteLLM proxy URL + virtual key. When BOTH are set, the script calls the proxy's `circle_ci_mcp-get_build_failure_logs` MCP tool to splice raw CircleCI failure log tails into the LLM's view — the proxy holds the CircleCI credential, so no CircleCI token lives in your env. Without these, only GitHub's check-run summaries are used. |
 
 ## Layout
 

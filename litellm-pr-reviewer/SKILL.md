@@ -17,7 +17,7 @@ If they only give a number, assume `BerriAI/litellm`.
 
 ## Required environment
 
-The host shell must have `GITHUB_TOKEN` set (PAT with `public_repo` scope is enough; `repo` if the target repo is private). Set `CIRCLECI_TOKEN` too if you want raw CircleCI failure logs spliced in — without it the script falls back to GitHub's check-run summary alone.
+The host shell must have `GITHUB_TOKEN` set (PAT with `public_repo` scope is enough; `repo` if the target repo is private). For raw CircleCI failure log tails to be spliced in, also set `LITELLM_API_BASE` + `LITELLM_API_KEY` (the script calls the LiteLLM proxy's `circle_ci_mcp-get_build_failure_logs` MCP tool, which holds the CircleCI credential server-side). Without those, the script falls back to GitHub's check-run summary alone.
 
 If `GITHUB_TOKEN` is missing, tell the user and stop. Don't try to triage on the unauthenticated 60 req/hr quota — it will 403 partway through and you'll silently miss checks.
 
@@ -32,7 +32,7 @@ If `GITHUB_TOKEN` is missing, tell the user and stop. Don't try to triage on the
 
 ## Step 1: gather data
 
-Run the bundled script with the PR reference. It prints a single JSON object to stdout describing the PR's checks, diff files, Greptile score, and (if CIRCLECI_TOKEN is set) CircleCI failure log tails.
+Run the bundled script with the PR reference. It prints a single JSON object to stdout describing the PR's checks, diff files, Greptile score, and (if `LITELLM_API_BASE` + `LITELLM_API_KEY` are set) CircleCI failure log tails fetched via the LiteLLM proxy's MCP endpoint.
 
 ```bash
 python "${CLAUDE_SKILL_DIR}/scripts/gather_pr_triage_data.py" "$ARGUMENTS"
