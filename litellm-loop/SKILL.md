@@ -21,7 +21,7 @@ This is the contributor-side analog of `/greploop`: same shape (review → fix �
 |---|---|---|
 | `GITHUB_TOKEN` | yes | PAT with `public_repo` (or `repo` for private). Used to push and to read PR/check state directly when the bot doesn't surface a detail. |
 | `LITELLM_BOT_URL` | one of | Base URL of a `litellm-bot` instance exposing `/chat/api` (e.g. `https://litellm-bot.fly.dev`). Required for `http` transport. |
-| `LITELLM_BOT_AUTH_COOKIE` | with `LITELLM_BOT_URL` | If the bot has `AUTH_ENABLED=True`, paste the session cookie value (the bot's `/chat` UI sets it). Skip if `AUTH_ENABLED=False`. |
+| `LITELLM_BOT_API_KEY` | with `LITELLM_BOT_URL` | Bearer token that the bot accepts on `/chat/api`. The bot operator mints these and configures them via `BOT_API_KEYS` (CSV) on the bot side. Skip if the bot has no auth configured. |
 | `SLACK_WEBHOOK_URL` | one of | Incoming webhook scoped to a channel the bot is in. Required for `slack` transport. |
 | `SLACK_BOT_USER_TOKEN` | with `SLACK_WEBHOOK_URL` | `xoxp-…` user token with `channels:history` so this skill can read the bot's reply back. |
 
@@ -78,7 +78,7 @@ Repeat the cycle below. **Max 5 iterations.** Each iteration ends with either an
 THREAD_ID=$(uuidgen | tr 'A-Z' 'a-z' | tr -d '-')
 RESP=$(curl -s "${LITELLM_BOT_URL}/chat/api" \
   -H 'content-type: application/json' \
-  ${LITELLM_BOT_AUTH_COOKIE:+-H "cookie: session=${LITELLM_BOT_AUTH_COOKIE}"} \
+  ${LITELLM_BOT_API_KEY:+-H "Authorization: Bearer ${LITELLM_BOT_API_KEY}"} \
   -d "$(jq -nc --arg msg "Triage this PR: $PR_URL" --arg tid "$THREAD_ID" \
         '{message: $msg, thread_id: $tid}')")
 CARD=$(echo "$RESP" | jq -r .output)
@@ -91,11 +91,13 @@ If the bot also exposes `/chat/api/threads/<id>` (it does in the dev UI), fetch 
 ```bash
 DRILLDOWN_RESP=$(curl -s "${LITELLM_BOT_URL}/chat/api" \
   -H 'content-type: application/json' \
-  ${LITELLM_BOT_AUTH_COOKIE:+-H "cookie: session=${LITELLM_BOT_AUTH_COOKIE}"} \
+  ${LITELLM_BOT_API_KEY:+-H "Authorization: Bearer ${LITELLM_BOT_API_KEY}"} \
   -d "$(jq -nc --arg msg "Show drilldown" --arg tid "$THREAD_ID" \
         '{message: $msg, thread_id: $tid}')")
 DRILLDOWN=$(echo "$DRILLDOWN_RESP" | jq -r .output)
 ```
+
+If the bot returns `401`, your `LITELLM_BOT_API_KEY` is unset or wrong — fix it and retry. Don't fall back to unauthenticated requests; that path is only valid against a wide-open bot (`BOT_API_KEYS` unset on the bot side, intended for local dev only).
 
 #### A.2 — `slack` transport (fallback)
 

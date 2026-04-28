@@ -51,7 +51,7 @@ If you omit the PR ref, the skill detects it from `gh pr view` on the current br
 |---|---|---|
 | `GITHUB_TOKEN` | yes | PAT with `public_repo` scope (`repo` for private). Used for `git push` and direct GitHub reads when the bot doesn't surface a detail. |
 | `LITELLM_BOT_URL` | one transport | Base URL of a `litellm-bot` instance exposing `/chat/api` (e.g. `https://litellm-bot.fly.dev`). Required for `http` transport. |
-| `LITELLM_BOT_AUTH_COOKIE` | with `LITELLM_BOT_URL` | Session cookie value if the bot has `AUTH_ENABLED=True`. Skip otherwise. |
+| `LITELLM_BOT_API_KEY` | with `LITELLM_BOT_URL` | Bearer token that `litellm-bot` accepts on `/chat/api`. Operators mint keys and configure them via `BOT_API_KEYS` (CSV) on the bot side, then hand individual keys to contributors. Skip if the bot has no auth configured. |
 | `SLACK_WEBHOOK_URL` | one transport | Incoming webhook scoped to a channel `litellm-bot` is in. Required for `slack` transport. |
 | `SLACK_BOT_USER_TOKEN` | with `SLACK_WEBHOOK_URL` | `xoxp-…` user token with `channels:history` so the skill can read the bot's reply back. |
 
