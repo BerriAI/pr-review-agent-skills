@@ -49,6 +49,7 @@ Call it **exactly once**. The output is a JSON object with these fields:
 - `failing_check_contexts` — for each failing check: `check_name`, `conclusion`, `summary`, `failure_excerpt`, `annotations`, `html_url`, `other_prs` (same check's status on each sampled PR), `is_policy_meta` (bool: pre-flagged PR-shape policy check like `Verify PR source branch` / `DCO` / `cla-bot`; ALWAYS bucket as `related_to_pr_diff=false`), `also_failing_on_other_prs` (bool: pre-derived; true iff at least one entry in `other_prs` has `conclusion` in `{failure, timed_out, cancelled}`)
 - `greptile_score` — int 1–5 or `null`
 - `has_circleci_checks` — bool
+- `veria` — `{ran: bool, high_count: int, all_findings: [{severity, html_url}]}` or `null` on fetch error. `ran=false` means Veria has not commented on this PR yet. `high_count` counts inline review comments tagged `High` or `Critical`.
 - `mergeable` — `true` (clean merge), `false` (merge conflicts) or `null` (GitHub still computing — treat as unknown)
 - `mergeable_state` — string: `"clean"`, `"unstable"`, `"dirty"` (conflicts), `"blocked"` (required review/check missing), `"behind"` (base moved), `"unknown"`, etc.
 
@@ -89,6 +90,9 @@ Exactly one of:
 - `status` is `all_green` or `unrelated_failures`
 - `in_progress_checks` is empty
 - `greptile_score` is `null` OR `>= 4`
+- `has_circleci_checks` is `true`
+- `veria` is `null` OR `veria.ran is false` OR `veria.high_count == 0`
+  
 
 Otherwise `ready` is `false`.
 
@@ -96,13 +100,14 @@ CircleCI presence does NOT affect `ready` — many OSS PRs from external contrib
 
 ## Step 5: emit the 5-item checklist
 
-Exactly these 5 items in this order:
+Exactly these 6 items in this order:
 
 1. `All checks completed` — passed iff `in_progress_checks` is empty. Note when not passed: `<N> still running: <comma-joined names, max 3>`.
 2. `No failing checks` — passed iff `failing_check_contexts` is empty. Note when not passed: `<N> failing: <comma-joined check_names, max 3>`.
 3. `No PR-related failures` — passed iff no failure has `related_to_pr_diff == true`. Note when not passed: `<N> PR-related: <comma-joined check_names, max 3>`.
 4. `Greptile score >= 4/5` — if `greptile_score` is `null`: passed = true, note = `not reviewed by Greptile yet`. Otherwise passed = `greptile_score >= 4`, note = `<greptile_score>/5` (always, even when passed).
-5. `CircleCI tests present` — informational only, never blocks `ready`. Always passed = `true`. Note = `""` when `has_circleci_checks` is `true`; otherwise note = `no CircleCI checks ran on this PR (common for OSS contributors without secrets access) — reviewer should run them manually if needed`.
+5. `No high-severity Veria findings` — passed iff `veria` is `null` OR `veria.ran is false` OR `veria.high_count == 0`. Note: empty when `veria.ran is true` AND `veria.high_count == 0`; `not run by Veria yet` when `veria.ran is false`; `<N> high/critical finding(s) open` when failing; `Veria fetch failed` when `veria` is `null`.
+6. `CircleCI tests present` — informational only, never blocks `ready`. Always passed = `true`. Note = `""` when `has_circleci_checks` is `true`; otherwise note = `no CircleCI checks ran on this PR (common for OSS contributors without secrets access) — reviewer should run them manually if needed`.
 
 Note is empty (`""`) for items 1–3 when passed.
 
